@@ -1,0 +1,6 @@
+name = "lookout"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+ENVIRONMENT = "production"

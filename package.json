@@ -1,0 +1,15 @@
+{
+  "name": "lookout",
+  "version": "0.1.0",
+  "description": "Daemon-lensed search — personalized results filtered through your daemon profile",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250320.0",
+    "typescript": "^6.0.2",
+    "wrangler": "^4.0.0"
+  }
+}
