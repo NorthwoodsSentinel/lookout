@@ -7,6 +7,53 @@ interface Env {
   ENVIRONMENT: string;
 }
 
+// "Knowledge without mileage equals bullshit" — Henry Rollins
+const SECURITY_HEADERS: Record<string, string> = {
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+  'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+};
+
+// ── IP-based Rate Limiting (10 searches/min/IP) ──────────────
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (entry.count >= 10) return false;
+  entry.count++;
+  return true;
+}
+
+// Periodic cleanup — drop expired entries to prevent memory leak
+function cleanupRateLimits() {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitMap) {
+    if (now > entry.resetAt) rateLimitMap.delete(ip);
+  }
+}
+
+function secureHtmlResponse(body: string, init?: ResponseInit): Response {
+  const headers = new Headers(init?.headers);
+  headers.set('Content-Type', 'text/html; charset=utf-8');
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) headers.set(k, v);
+  return new Response(body, { ...init, headers });
+}
+
+function secureJsonResponse(data: unknown, init?: ResponseInit): Response {
+  const headers = new Headers(init?.headers);
+  headers.set('Content-Type', 'application/json');
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) headers.set(k, v);
+  return new Response(JSON.stringify(data), { ...init, headers });
+}
+
 // ── Daemon Profile (inline for MVP) ────────────────────────────
 
 // ── EDIT THIS ── Your daemon profile controls how results are filtered.
@@ -341,7 +388,7 @@ async function handleSearch(
       results: [],
       daemon: "lookout",
       ts: new Date().toISOString(),
-      error: `Brave Search failed: ${e instanceof Error ? e.message : String(e)}`,
+      error: "Search temporarily unavailable",
     };
   }
 
@@ -371,7 +418,7 @@ async function handleSearch(
       results: daemonResults,
       daemon: "lookout",
       ts: new Date().toISOString(),
-      error: `Claude re-ranking failed (showing raw results): ${e instanceof Error ? e.message : String(e)}`,
+      error: "Search temporarily unavailable — showing unranked results",
     };
   }
 
@@ -390,9 +437,12 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // Periodic rate limit cleanup
+    cleanupRateLimits();
+
     // Health check
     if (path === "/health") {
-      return Response.json({
+      return secureJsonResponse({
         status: "ok",
         daemon: "lookout",
         ts: new Date().toISOString(),
@@ -401,45 +451,54 @@ export default {
 
     // Landing page
     if (path === "/" && request.method === "GET") {
-      return new Response(renderSearchPage(), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
+      return secureHtmlResponse(renderSearchPage());
+    }
+
+    // Rate limit check for search endpoints
+    const ip = request.headers.get("cf-connecting-ip") || "unknown";
+    if (path === "/search" && !checkRateLimit(ip)) {
+      return secureJsonResponse(
+        { error: "Rate limit exceeded. Max 10 searches per minute." },
+        { status: 429 }
+      );
     }
 
     // GET /search?q=...
     if (path === "/search" && request.method === "GET") {
       const query = url.searchParams.get("q")?.trim();
       if (!query) {
-        return new Response(renderSearchPage(), {
-          headers: { "Content-Type": "text/html; charset=utf-8" },
-        });
+        return secureHtmlResponse(renderSearchPage());
       }
 
       const data = await handleSearch(query, 5, env);
-      return new Response(renderSearchPage(query, data.results, data.error), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
+      return secureHtmlResponse(renderSearchPage(query, data.results, data.error));
     }
 
     // POST /search — JSON API
     if (path === "/search" && request.method === "POST") {
+      // Content-Type validation
+      const contentType = request.headers.get("Content-Type") || "";
+      if (!contentType.includes("application/json")) {
+        return secureJsonResponse({ error: "Content-Type must be application/json" }, { status: 415 });
+      }
+
       let body: { query?: string; count?: number };
       try {
         body = (await request.json()) as { query?: string; count?: number };
       } catch {
-        return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+        return secureJsonResponse({ error: "Invalid JSON body" }, { status: 400 });
       }
 
       const query = body.query?.trim();
       if (!query) {
-        return Response.json({ error: "Missing 'query' field" }, { status: 400 });
+        return secureJsonResponse({ error: "Missing 'query' field" }, { status: 400 });
       }
 
       const count = Math.min(Math.max(body.count ?? 5, 1), 10);
       const data = await handleSearch(query, count, env);
-      return Response.json(data);
+      return secureJsonResponse(data);
     }
 
-    return Response.json({ error: "Not found" }, { status: 404 });
+    return secureJsonResponse({ error: "Not found" }, { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
