@@ -4,7 +4,24 @@
 interface Env {
   BRAVE_SEARCH_KEY: string;
   ANTHROPIC_API_KEY: string;
+  LOOKOUT_API_KEY: string;
   ENVIRONMENT: string;
+}
+
+// ── Auth ──────────────────────────────────────────────────────
+
+function requireAuth(request: Request, env: Env): Response | null {
+  const headerKey = request.headers.get('Authorization')?.replace('Bearer ', '');
+  const paramKey = new URL(request.url).searchParams.get('key');
+  const key = headerKey || paramKey;
+
+  if (!env.LOOKOUT_API_KEY || !key || key !== env.LOOKOUT_API_KEY) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', ...SECURITY_HEADERS },
+    });
+  }
+  return null;
 }
 
 // "Knowledge without mileage equals bullshit" — Henry Rollins
@@ -448,6 +465,10 @@ export default {
         ts: new Date().toISOString(),
       });
     }
+
+    // Everything below requires auth
+    const authFail = requireAuth(request, env);
+    if (authFail) return authFail;
 
     // Landing page
     if (path === "/" && request.method === "GET") {
