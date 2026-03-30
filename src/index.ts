@@ -75,13 +75,13 @@ function secureJsonResponse(data: unknown, init?: ResponseInit): Response {
 
 // ── EDIT THIS ── Your daemon profile controls how results are filtered.
 // See: https://danielmiessler.com/blog/launching-daemon-personal-api
-const DAEMON_PROFILE = `Name: [Your name]
-Role: [Your profession, background, expertise level]
-Expertise: [What you already know — helps skip beginner content]
-Preferences: [How you like content delivered — code vs theory, practical vs academic, etc]
-Already knows: [Topics to skip introductory content for]
-Skip: [Types of content you never want — marketing, listicles, beginner tutorials, etc]
-Prefer: [Types of sources you trust — GitHub repos, research papers, specific blogs, etc]`;
+const DAEMON_PROFILE = `Name: Rob Chuvala
+Role: Cybersecurity consultant, 20 years. COE strategy, AI integration, mid-market focus.
+Expertise: Security operations, threat intelligence, vendor evaluation, AI infrastructure, personal AI systems.
+Preferences: Practical over theoretical. Code over slides. Primary sources over summaries.
+Already knows: SIEM/SOAR, endpoint security, network security, cloud security fundamentals, AI/ML basics.
+Skip: Marketing content, vendor press releases, beginner tutorials, listicles, AI hype pieces.
+Prefer: GitHub repos, research papers, Hacker News, security conference talks, RFC documents, practitioner blogs.`;
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -490,6 +490,9 @@ export default {
       if (!query) {
         return secureHtmlResponse(renderSearchPage());
       }
+      if (query.length > 500) {
+        return secureJsonResponse({ error: "Query too long. Maximum 500 characters." }, { status: 400 });
+      }
 
       const data = await handleSearch(query, 5, env);
       return secureHtmlResponse(renderSearchPage(query, data.results, data.error));
@@ -513,6 +516,9 @@ export default {
       const query = body.query?.trim();
       if (!query) {
         return secureJsonResponse({ error: "Missing 'query' field" }, { status: 400 });
+      }
+      if (query.length > 500) {
+        return secureJsonResponse({ error: "Query too long. Maximum 500 characters." }, { status: 400 });
       }
 
       const count = Math.min(Math.max(body.count ?? 5, 1), 10);
