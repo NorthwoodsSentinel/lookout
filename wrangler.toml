@@ -4,3 +4,13 @@ compatibility_date = "2025-01-01"
 
 [vars]
 ENVIRONMENT = "production"
+
+# v0.3 — daily scheduled discover (rotates through default anchors, alerts on new high-scoring candidates)
+[triggers]
+crons = ["0 14 * * *"]   # 14:00 UTC = 9:00 AM Central — daily
+
+# KV namespace for scheduled-discover state (seen candidates, alerts, run history)
+# Before deploy: create with `wrangler kv namespace create LOOKOUT_KV` and paste the ID below.
+[[kv_namespaces]]
+binding = "LOOKOUT_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"

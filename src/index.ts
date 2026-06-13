@@ -8,6 +8,12 @@ interface Env {
   LOOKOUT_API_KEY: string;
   GITHUB_TOKEN: string;
   ENVIRONMENT: string;
+  // v0.3 — scheduled discover state + notifications
+  LOOKOUT_KV: KVNamespace;
+  NOTIFY_EMAIL_TO?: string;        // optional — destination address
+  NOTIFY_EMAIL_FROM?: string;      // optional — must be a verified address on your CF zone
+  MYCELIA_API_BASE?: string;       // optional — fleet event distribution
+  MYCELIA_KEY_LOOKOUT?: string;    // optional — bearer for the Mycelia POST
 }
 
 // ── Auth ──────────────────────────────────────────────────────
@@ -898,6 +904,163 @@ async function handleDiscover(body: DiscoverRequest, env: Env): Promise<Discover
   };
 }
 
+// ── Notifications (Mycelia event + email via MailChannels) ─────
+
+async function notifyMycelia(env: Env, payload: { type: string; title: string; body: string; metadata?: Record<string, unknown> }): Promise<void> {
+  if (!env.MYCELIA_API_BASE || !env.MYCELIA_KEY_LOOKOUT) return;
+  await fetch(`${env.MYCELIA_API_BASE}/v1/request`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.MYCELIA_KEY_LOOKOUT}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
+
+async function notifyEmail(env: Env, subject: string, plain: string): Promise<void> {
+  if (!env.NOTIFY_EMAIL_TO || !env.NOTIFY_EMAIL_FROM) return;
+  await fetch("https://api.mailchannels.net/tx/v1/send", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: env.NOTIFY_EMAIL_TO }] }],
+      from: { email: env.NOTIFY_EMAIL_FROM, name: "Lookout Discover" },
+      subject,
+      content: [{ type: "text/plain", value: plain }],
+    }),
+  }).catch(() => {});
+}
+
+// ── Scheduled Discover (rotates anchors, diffs against seen, alerts) ──
+
+const ROTATION_ANCHORS = [
+  "NorthwoodsSentinel/loam",
+  "NorthwoodsSentinel/mycelia",
+  "modelcontextprotocol/servers",
+  "bluesky-social/atproto",
+  "NorthwoodsSentinel/brook",
+  "modelcontextprotocol/registry",
+  "NorthwoodsSentinel/sentinel",
+  "NorthwoodsSentinel/wild-garden",
+];
+
+async function getSeenLogins(kv: KVNamespace): Promise<Set<string>> {
+  const raw = await kv.get("seen:logins");
+  return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+}
+
+async function setSeenLogins(kv: KVNamespace, logins: Set<string>): Promise<void> {
+  // Cap at 5000 logins to avoid unbounded growth
+  const arr = Array.from(logins).slice(-5000);
+  await kv.put("seen:logins", JSON.stringify(arr));
+}
+
+async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_candidates: number; alerts: number }> {
+  // Daily rotation — anchor index based on day-of-year so each anchor gets fresh weekly+
+  const dayOfYear = Math.floor((Date.now() - new Date(new Date().getUTCFullYear(), 0, 0).getTime()) / 86400000);
+  const anchor = ROTATION_ANCHORS[dayOfYear % ROTATION_ANCHORS.length];
+
+  // Pull contributors from today's anchor
+  let logins: string[];
+  try {
+    logins = await fetchContributors(anchor, env.GITHUB_TOKEN, 30);
+  } catch {
+    return { anchor, new_candidates: 0, alerts: 0 };
+  }
+
+  // Diff against seen
+  const seen = await getSeenLogins(env.LOOKOUT_KV);
+  const fresh = logins.filter((l) => !seen.has(l));
+
+  if (fresh.length === 0) {
+    return { anchor, new_candidates: 0, alerts: 0 };
+  }
+
+  // Build candidate dossiers for fresh logins only
+  const candidates: Candidate[] = [];
+  for (const login of fresh.slice(0, 30)) {
+    const c = await buildCandidate(login, anchor, env.GITHUB_TOKEN);
+    if (c) candidates.push(c);
+  }
+
+  if (candidates.length === 0) {
+    // Still mark fresh as seen so we don't keep re-fetching dead profiles
+    fresh.forEach((l) => seen.add(l));
+    await setSeenLogins(env.LOOKOUT_KV, seen);
+    return { anchor, new_candidates: 0, alerts: 0 };
+  }
+
+  // Re-rank via Claude
+  let ranked: DiscoverResult[];
+  try {
+    ranked = await valuesRerank(candidates, env.ANTHROPIC_API_KEY);
+  } catch {
+    fresh.forEach((l) => seen.add(l));
+    await setSeenLogins(env.LOOKOUT_KV, seen);
+    return { anchor, new_candidates: candidates.length, alerts: 0 };
+  }
+
+  // Alert on values_score >= 8
+  const alerts = ranked.filter((r) => r.values_score >= 8);
+
+  // Store each alert as a separate KV row for later /alerts review
+  const ts = Date.now();
+  for (const a of alerts) {
+    const key = `alert:${ts}:${a.login}`;
+    await env.LOOKOUT_KV.put(
+      key,
+      JSON.stringify({ ...a, anchor, found_at: new Date(ts).toISOString(), read: false }),
+      { expirationTtl: 60 * 60 * 24 * 90 }, // 90 days
+    );
+  }
+
+  // Mark all fresh logins as seen
+  fresh.forEach((l) => seen.add(l));
+  await setSeenLogins(env.LOOKOUT_KV, seen);
+
+  // Fan-out notifications
+  if (alerts.length > 0) {
+    const bodyLines = alerts.map((a) =>
+      `@${a.login}${a.name ? ` (${a.name})` : ""}  score:${a.values_score}\n` +
+      `  ${a.html_url}\n` +
+      `  bio: ${a.bio || "—"}\n` +
+      `  why: ${a.values_notes}\n` +
+      `  intro: ${a.suggested_intro}\n` +
+      `  reach: ${a.reach_via.join(" · ")}\n`
+    );
+    const plain = `Lookout found ${alerts.length} new high-scoring values-aligned candidate(s) in ${anchor}.\n\n${bodyLines.join("\n")}\n\nReview at /alerts on your Lookout instance.`;
+
+    await Promise.allSettled([
+      notifyMycelia(env, {
+        type: "lookout-discover-alert",
+        title: `${alerts.length} new values-aligned candidate(s) from ${anchor}`,
+        body: plain,
+        metadata: { anchor, count: alerts.length, ts },
+      }),
+      notifyEmail(env, `Lookout: ${alerts.length} new values-aligned candidate(s) from ${anchor}`, plain),
+    ]);
+  }
+
+  return { anchor, new_candidates: candidates.length, alerts: alerts.length };
+}
+
+// ── /alerts review helpers ─────────────────────────────────────
+
+async function listAlerts(kv: KVNamespace, unreadOnly: boolean): Promise<Array<DiscoverResult & { anchor: string; found_at: string; read: boolean }>> {
+  const list = await kv.list({ prefix: "alert:" });
+  const out: Array<DiscoverResult & { anchor: string; found_at: string; read: boolean }> = [];
+  for (const k of list.keys) {
+    const raw = await kv.get(k.name);
+    if (!raw) continue;
+    const a = JSON.parse(raw) as DiscoverResult & { anchor: string; found_at: string; read: boolean };
+    if (unreadOnly && a.read) continue;
+    out.push(a);
+  }
+  out.sort((a, b) => b.found_at.localeCompare(a.found_at));
+  return out;
+}
+
 // ── Worker Entry ───────────────────────────────────────────────
 
 export default {
@@ -1009,6 +1172,62 @@ export default {
       return secureJsonResponse(data);
     }
 
+    // GET /alerts — list high-scoring candidates surfaced by scheduled discover
+    if (path === "/alerts" && request.method === "GET") {
+      const unreadOnly = url.searchParams.get("unread") === "true";
+      const alerts = await listAlerts(env.LOOKOUT_KV, unreadOnly);
+      return secureJsonResponse({
+        alerts,
+        total: alerts.length,
+        unread: alerts.filter((a) => !a.read).length,
+      });
+    }
+
+    // POST /alerts/ack — mark alerts as read
+    if (path === "/alerts/ack" && request.method === "POST") {
+      let body: { logins?: string[]; all?: boolean };
+      try {
+        body = (await request.json()) as { logins?: string[]; all?: boolean };
+      } catch {
+        return secureJsonResponse({ error: "Invalid JSON body" }, { status: 400 });
+      }
+      const list = await env.LOOKOUT_KV.list({ prefix: "alert:" });
+      let acked = 0;
+      for (const k of list.keys) {
+        const raw = await env.LOOKOUT_KV.get(k.name);
+        if (!raw) continue;
+        const a = JSON.parse(raw) as DiscoverResult & { anchor: string; found_at: string; read: boolean };
+        if (a.read) continue;
+        if (body.all || body.logins?.includes(a.login)) {
+          a.read = true;
+          await env.LOOKOUT_KV.put(k.name, JSON.stringify(a), { expirationTtl: 60 * 60 * 24 * 90 });
+          acked++;
+        }
+      }
+      return secureJsonResponse({ acked });
+    }
+
+    // POST /cron/run — manual trigger for scheduled discover (testing + on-demand)
+    if (path === "/cron/run" && request.method === "POST") {
+      const result = await runScheduledDiscover(env);
+      return secureJsonResponse({
+        ...result,
+        ts: new Date().toISOString(),
+        message: `Ran ${result.anchor}, found ${result.new_candidates} new candidates, ${result.alerts} alerts at score >= 8`,
+      });
+    }
+
     return secureJsonResponse({ error: "Not found" }, { status: 404 });
+  },
+
+  // ── Cron Handler ─────────────────────────────────────────────
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      runScheduledDiscover(env).then((r) => {
+        console.log(`Lookout scheduled discover: ${r.anchor} → ${r.new_candidates} new, ${r.alerts} alerts`);
+      }).catch((e) => {
+        console.error("Lookout scheduled discover failed:", e);
+      }),
+    );
   },
 } satisfies ExportedHandler<Env>;
