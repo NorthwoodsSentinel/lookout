@@ -132,6 +132,10 @@ interface LensSnapshot {
   preferences: string;
   known_domains: string;
   exclusions: string;
+  // v0.5 — values lens (for /discover), distilled from the same daemon pull
+  values_signals: string;       // what to look FOR in people
+  values_anti_signals: string;  // what to penalize
+  connection_intent: string;    // why they're looking — what the community is FOR
   provenance: string;     // daemon URL + distillation model
 }
 
@@ -164,9 +168,9 @@ async function fetchDaemonAll(env: Env): Promise<string | null> {
 }
 
 async function distillLens(raw: string, apiKey: string): Promise<Omit<LensSnapshot, "version" | "fetched_at" | "source_bytes" | "provenance"> | null> {
-  const prompt = `Distill this person's full daemon context into a search lens. Output ONLY valid JSON with exactly these five string fields, each a compact plain-text block under 120 words, using the subject's own words wherever possible. Do not add interpretation or new facts. If the context genuinely lacks material for a field, write "none stated".
+  const prompt = `Distill this person's full daemon context into a search lens and a values lens. Output ONLY valid JSON with exactly these eight string fields, each a compact plain-text block under 120 words, using the subject's own words wherever possible. Do not add interpretation or new facts. If the context genuinely lacks material for a field, write "none stated".
 
-{"identity": "who they are, role, background", "current_missions": "what they are actively building and pursuing NOW", "preferences": "format and source preferences for information", "known_domains": "what they already know deeply (results below this level are noise)", "exclusions": "everything the context marks as skip, avoid, banned, or unwanted"}
+{"identity": "who they are, role, background", "current_missions": "what they are actively building and pursuing NOW", "preferences": "format and source preferences for information", "known_domains": "what they already know deeply (results below this level are noise)", "exclusions": "everything the context marks as skip, avoid, banned, or unwanted", "values_signals": "what this person values in OTHER PEOPLE and their work — the qualities of someone they would want to build community with", "values_anti_signals": "qualities, postures, and language in other people that this person would walk away from", "connection_intent": "WHY they are looking for people — what the community or collaboration is for"}
 
 DAEMON CONTEXT:
 ${raw}`;
@@ -182,12 +186,16 @@ ${raw}`;
     const parsed = JSON.parse(text) as Record<string, string>;
     const need = ["identity", "current_missions", "preferences", "known_domains", "exclusions"];
     if (!need.every((k) => typeof parsed[k] === "string" && parsed[k].length > 0)) return null;
+    const opt = (k: string) => (typeof parsed[k] === "string" && parsed[k].length > 0 ? parsed[k] : "none stated");
     return {
       identity: parsed.identity,
       current_missions: parsed.current_missions,
       preferences: parsed.preferences,
       known_domains: parsed.known_domains,
       exclusions: parsed.exclusions,
+      values_signals: opt("values_signals"),
+      values_anti_signals: opt("values_anti_signals"),
+      connection_intent: opt("connection_intent"),
     };
   } catch {
     return null;
@@ -241,6 +249,29 @@ async function getLens(env: Env): Promise<ActiveLens> {
     }
   } catch { /* fall through to legacy */ }
   return { text: DAEMON_PROFILE, version: "legacy-2026-03", state: "legacy-fallback" };
+}
+
+// ── v0.5: Values lens — the /discover judge, daemon-fed with the same contract ──
+// The SIGNALS come from the daemon distillation; the output contract and the
+// operational anti-signal floor stay code-owned. Fallback: legacy inline profile.
+
+interface ActiveValuesLens { text: string; version: string; state: "fresh" | "stale" | "legacy-fallback" }
+
+async function getValuesLens(env: Env): Promise<ActiveValuesLens> {
+  try {
+    const raw = await env.LOOKOUT_KV.get(LENS_KV_KEY);
+    if (raw) {
+      const lens = JSON.parse(raw) as LensSnapshot;
+      if (lens.values_signals && lens.values_signals !== "none stated") {
+        const age = Date.now() - Date.parse(lens.fetched_at);
+        const anti = lens.values_anti_signals !== "none stated" ? lens.values_anti_signals : "Vendor-pitch posture, platform evangelism, output-free self-promotion";
+        const intent = lens.connection_intent !== "none stated" ? `WHY THEY ARE LOOKING (what the community is for):\n${lens.connection_intent}\n\n` : "";
+        const text = `${intent}VALUES SIGNALS (positive — score high if present):\n${lens.values_signals}\n\nANTI-SIGNALS (negative — penalize):\n${anti}\n\nOperational anti-signal floor (always applies): marketing language ("comprehensive", "utilize", "leverage", "robust", "seamless", "next-generation"), "Founder & CEO" puffery with no substantive output, single-repo accounts with no prior work, follower count without corresponding output.`;
+        return { text, version: lens.version, state: age < LENS_FRESH_MS ? "fresh" : "stale" };
+      }
+    }
+  } catch { /* fall through to legacy */ }
+  return { text: VALUES_PROFILE, version: "legacy-2026-03", state: "legacy-fallback" };
 }
 
 // ── v0.4: ntfy notification (fleet alert surface; SessionStart relay reads the same topic) ──
@@ -361,6 +392,8 @@ interface DiscoverResponse {
   total_candidates: number;
   results: DiscoverResult[];
   daemon: string;
+  values_lens_version?: string;   // v0.5 — which values lens judged these candidates
+  values_lens_state?: string;     // fresh | stale | legacy-fallback
   ts: string;
   error?: string;
 }
@@ -624,6 +657,7 @@ function dossier(c: Candidate): string {
 async function valuesRerank(
   candidates: Candidate[],
   apiKey: string,
+  valuesText: string,
 ): Promise<DiscoverResult[]> {
   if (candidates.length === 0) return [];
 
@@ -631,7 +665,7 @@ async function valuesRerank(
 
   const prompt = `You are a values-alignment filter for Rob Chuvala. Your job is to read GitHub candidate profiles and rank them by how strongly they match Rob's values.
 
-${VALUES_PROFILE}
+${valuesText}
 
 PRIVACY GUARDRAILS (hard rules):
 - Base every claim ONLY on the candidate's public output shown in the dossier. Never infer protected or sensitive attributes (health, politics, religion, finances, relationships).
@@ -1049,16 +1083,19 @@ async function handleDiscover(body: DiscoverRequest, env: Env): Promise<Discover
     };
   }
 
-  // Phase 3: re-rank via Claude
+  // Phase 3: re-rank via Claude through the values lens (daemon-fed, v0.5)
+  const vlens = await getValuesLens(env);
   let ranked: DiscoverResult[];
   try {
-    ranked = await valuesRerank(candidates, env.ANTHROPIC_API_KEY);
+    ranked = await valuesRerank(candidates, env.ANTHROPIC_API_KEY, vlens.text);
   } catch (e) {
     return {
       mode,
       total_candidates: candidates.length,
       results: [],
       daemon: "lookout-discover",
+      values_lens_version: vlens.version,
+      values_lens_state: vlens.state,
       ts: new Date().toISOString(),
       error: "Re-ranking temporarily unavailable",
     };
@@ -1069,6 +1106,8 @@ async function handleDiscover(body: DiscoverRequest, env: Env): Promise<Discover
     total_candidates: candidates.length,
     results: ranked.slice(0, count),
     daemon: "lookout-discover",
+    values_lens_version: vlens.version,
+    values_lens_state: vlens.state,
     ts: new Date().toISOString(),
   };
 }
@@ -1265,10 +1304,11 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
     return { anchor, new_candidates: 0, alerts: 0 };
   }
 
-  // Re-rank via Claude
+  // Re-rank via Claude through the values lens (daemon-fed, v0.5)
+  const vlens = await getValuesLens(env);
   let ranked: DiscoverResult[];
   try {
-    ranked = await valuesRerank(candidates, env.ANTHROPIC_API_KEY);
+    ranked = await valuesRerank(candidates, env.ANTHROPIC_API_KEY, vlens.text);
   } catch {
     fresh.forEach((l) => seen.add(l));
     await setSeenLogins(env.LOOKOUT_KV, seen);
@@ -1285,7 +1325,7 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
     const key = `alert:${ts}:${a.login}`;
     await env.LOOKOUT_KV.put(
       key,
-      JSON.stringify({ ...a, anchor, found_at: new Date(ts).toISOString(), read: false }),
+      JSON.stringify({ ...a, anchor, values_lens_version: vlens.version, found_at: new Date(ts).toISOString(), read: false }),
       { expirationTtl: 60 * 60 * 24 * 90 }, // 90 days
     );
   }

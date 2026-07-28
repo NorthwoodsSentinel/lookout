@@ -191,3 +191,7 @@ Yes, it's one file. That's the point.
 Part of the [Northwoods Sentinel Labs](https://northwoodssentinel.com) ecosystem — open-source tools for human-centered AI.
 
 [Blog](https://northwoodssentinel.com) · [Substack](https://chewvala.substack.com) · [GitHub](https://github.com/NorthwoodsSentinel)
+
+### v0.5 — the values lens goes live too
+
+The `/discover` judge is now daemon-fed with the same contract as search: the daily distillation also produces `values_signals`, `values_anti_signals`, and `connection_intent` layers, every candidate response carries `values_lens_version`, and the hardcoded values profile becomes the fallback rung. The output contract and an operational anti-signal floor stay code-owned.
