@@ -1330,6 +1330,25 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
   return { anchor, new_candidates: candidates.length, alerts: alerts.length };
 }
 
+// ── v0.4.1: The daily pipeline — ONE code path for cron and manual trigger ──
+// The scheduled handler and POST /cron/run execute THIS function. A manual
+// run therefore observes exactly what the cron will do — no test-path drift.
+
+async function runDailyPipeline(env: Env): Promise<{ lens_version: string | null; lens_state: string; deadman_paged: boolean; anchor: string; new_candidates: number; alerts: number }> {
+  const lens = await refreshLens(env);
+  let deadman_paged = false;
+  if (!lens) {
+    const active = await getLens(env);
+    if (active.state !== "fresh") {
+      await notifyNtfy(env, "Lookout lens DEGRADED", `Daily lens refresh failed and active lens is ${active.state} (${active.version}). Results are being scored through an outdated lens until this is fixed.`, true);
+      deadman_paged = true;
+    }
+  }
+  const r = await runScheduledDiscover(env);
+  const after = await getLens(env);
+  return { lens_version: lens?.version ?? null, lens_state: after.state, deadman_paged, ...r };
+}
+
 // ── v0.4: Outcomes ledger + monthly digest ─────────────────────
 // "The model score is not the truth; Rob's later behavior is the truth."
 
@@ -1546,13 +1565,25 @@ export default {
       return secureJsonResponse({ acked });
     }
 
-    // POST /cron/run — manual trigger for scheduled discover (testing + on-demand)
+    // POST /cron/run — manual trigger for the FULL daily pipeline (same code path
+    // as the cron). Optional {"mode":"deadman-drill"} exercises only the
+    // failure-paging leg against current lens state.
     if (path === "/cron/run" && request.method === "POST") {
-      const result = await runScheduledDiscover(env);
+      let mode = "daily";
+      try { mode = ((await request.json()) as { mode?: string }).mode ?? "daily"; } catch { /* empty body = daily */ }
+      if (mode === "deadman-drill") {
+        const active = await getLens(env);
+        if (active.state !== "fresh") {
+          await notifyNtfy(env, "Lookout lens DEGRADED", `[DRILL] Active lens is ${active.state} (${active.version}). This page proves lens failure cannot be silent.`, true);
+          return secureJsonResponse({ drill: true, paged: true, lens_state: active.state, ts: new Date().toISOString() });
+        }
+        return secureJsonResponse({ drill: true, paged: false, lens_state: "fresh", note: "Lens is fresh — delete lens:snapshot first to make the drill real", ts: new Date().toISOString() });
+      }
+      const result = await runDailyPipeline(env);
       return secureJsonResponse({
         ...result,
         ts: new Date().toISOString(),
-        message: `Ran ${result.anchor}, found ${result.new_candidates} new candidates, ${result.alerts} alerts at score >= 8`,
+        message: `Daily pipeline: lens ${result.lens_version ?? "REFRESH-FAILED"} (${result.lens_state}) → ${result.anchor}: ${result.new_candidates} new candidates, ${result.alerts} alerts`,
       });
     }
 
@@ -1652,22 +1683,11 @@ export default {
       );
       return;
     }
-    // Daily: refresh the lens FIRST, then discover through it
+    // Daily: the same pipeline POST /cron/run exercises — no test-path drift
     ctx.waitUntil(
-      (async () => {
-        const lens = await refreshLens(env);
-        console.log(lens ? `Lens refreshed: ${lens.version}` : "Lens refresh failed — discover will use previous/legacy lens");
-        // Deadman: a dead lens must not look like a quiet week. If refresh
-        // failed AND the stored lens is past freshness, page loudly.
-        if (!lens) {
-          const active = await getLens(env);
-          if (active.state !== "fresh") {
-            await notifyNtfy(env, "Lookout lens DEGRADED", `Daily lens refresh failed and active lens is ${active.state} (${active.version}). Results are being scored through an outdated lens until this is fixed.`, true);
-          }
-        }
-        const r = await runScheduledDiscover(env);
-        console.log(`Lookout scheduled discover: ${r.anchor} → ${r.new_candidates} new, ${r.alerts} alerts`);
-      })().catch((e) => console.error("Lookout scheduled run failed:", e)),
+      runDailyPipeline(env)
+        .then((r) => console.log(`Lookout daily: lens ${r.lens_version ?? "REFRESH-FAILED"} (${r.lens_state}) → ${r.anchor}: ${r.new_candidates} new, ${r.alerts} alerts, deadman_paged=${r.deadman_paged}`))
+        .catch((e) => console.error("Lookout scheduled run failed:", e)),
     );
   },
 } satisfies ExportedHandler<Env>;
