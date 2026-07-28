@@ -2,15 +2,30 @@ name = "lookout"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
+# Template config — fork this repo, then create a gitignored wrangler.prod.toml
+# with your account_id + KV namespace id and deploy with:
+#   wrangler deploy -c wrangler.prod.toml
+
 [vars]
 ENVIRONMENT = "production"
+# DAEMON_URL = "https://your-daemon.example.workers.dev"   # enables the live lens (v0.4)
+# NTFY_TOPIC = "your-ntfy-topic"                            # enables severity-routed alerts (v0.4)
 
-# v0.3 — daily scheduled discover (rotates through default anchors, alerts on new high-scoring candidates)
+[observability]
+enabled = true
+
+# v0.3 — daily scheduled discover · v0.4 adds monthly digest (1st of month)
 [triggers]
-crons = ["0 14 * * *"]   # 14:00 UTC = 9:00 AM Central — daily
+crons = ["0 14 * * *", "0 15 1 * *"]   # 14:00 UTC daily = 9:00 AM Central · monthly digest
 
-# KV namespace for scheduled-discover state (seen candidates, alerts, run history)
-# Before deploy: create with `wrangler kv namespace create LOOKOUT_KV` and paste the ID below.
+# KV namespace for lens snapshot, seen-set, alerts, outcomes, yield, intent log
+# Create with `wrangler kv namespace create LOOKOUT_KV` and paste the ID below.
 [[kv_namespaces]]
 binding = "LOOKOUT_KV"
 id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Service binding to your daemon worker — REQUIRED if both run on workers.dev
+# (a Worker cannot fetch another *.workers.dev subdomain; the binding bypasses that)
+# [[services]]
+# binding = "DAEMON"
+# service = "your-daemon-worker-name"

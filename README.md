@@ -10,6 +10,17 @@ Google personalizes search based on surveillance. Lookout personalizes based on 
 
 **`/discover`** — adjacency-mining mode for finding values-aligned humans. Pulls contributors from N anchor repos (defaults: substrate-first projects like `loam`, `mycelia`, `modelcontextprotocol/servers`, `bluesky-social/atproto`), builds a candidate dossier for each (profile + top non-fork repos + topics), then Claude re-ranks against your values profile. Returns ranked candidates with values_score, the signals that landed, a suggested intro paragraph in your voice, and reachable contact paths.
 
+## v0.4 — the live lens
+
+v0.1–v0.3 scored through a profile hardcoded in `src/index.ts` — a snapshot that goes stale the day you write it. v0.4 makes the lens live:
+
+- **LensSnapshot** — once daily (and on `POST /lens/refresh`), lookout pulls your daemon's full context (`get_all` over MCP JSON-RPC), distills it into five layers (identity / current_missions / preferences / known_domains / exclusions) with one Claude call, content-hashes it, and stores it versioned in KV. Every search result carries the `lens_version` that scored it. Fallback ladder: fresh lens → stale lens (flagged) → the inline legacy profile (flagged). If your daemon and lookout both live on `*.workers.dev`, you need the `DAEMON` service binding (see wrangler.toml) — workers can't fetch sibling workers.dev subdomains over HTTP.
+- **Severity-routed alerts** — score ≥9 pages your [ntfy](https://ntfy.sh) topic urgent, ≥8 default, 6–7 accumulate for the monthly digest (second cron, 1st of the month). Email/Mycelia paths remain. A failed lens refresh past freshness pages loudly — a dead lens must not look like a quiet week.
+- **Dynamic anchors** — the rotation list lives in KV (`GET/POST /anchors`), kinds `github-repo` and experimental `rss` (the original brief said blogs). Per-anchor yield counters (evaluated → alerted) surface in the digest; rotation decisions stay human.
+- **Outcomes ledger** — `POST /outcome {login, status, note}` records what you actually did (reviewed / contacted / replied / collaborating / ignored). The model score is not the truth; your later behavior is the truth.
+- **Fleet intents** — `POST /intent` exposes exactly five narrow operations (`rank_search_results`, `discover_people`, `explain_match`, `record_outcome`, `get_lens_version`) so other agents can borrow the lens. Every call must declare a `purpose` and is logged.
+- **Dossier restraint** — candidate notes cite public output only, carry a confidence mark, and every intro is a draft requiring human review. Nothing is ever auto-sent.
+
 The whole thing runs on a single Cloudflare Worker. No database, no state, no tracking.
 
 ## What's a daemon profile?
