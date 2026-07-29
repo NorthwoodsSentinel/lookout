@@ -23,16 +23,37 @@ interface Env {
   SELF_GITHUB_LOGINS?: string;     // optional — comma-separated operator logins/orgs; default "NorthwoodsSentinel"
 }
 
-// ── Identity layer (v0.5.1) ──────────────────────────────────
+// ── Identity layer (v0.5.1, extended v0.6) ───────────────────
 // The operator is the positive control for the values lens, never a candidate.
 // Deterministic check, runs BEFORE any LLM sees a login (CoE 2026-07-29:
 // "identity recognition should not depend on an LLM"). Prevents self-alerts
 // and self-addressed intros; operator-owned anchors still surface their
-// OUTSIDE contributors.
+// OUTSIDE contributors. v0.6 adds the known-contact set: people who graduated
+// out of discovery because a relationship already exists.
+import { parseSelfLogins, isSelfLogin, classify, shouldAlert, calibrationDrift, GRADUATING_OUTCOMES } from "./identity";
+import type { ScoreTriple, Classification } from "./identity";
+
 function isSelf(login: string, env: Env): boolean {
-  const selfLogins = (env.SELF_GITHUB_LOGINS ?? "NorthwoodsSentinel")
-    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  return selfLogins.includes(login.toLowerCase());
+  return isSelfLogin(login, parseSelfLogins(env.SELF_GITHUB_LOGINS));
+}
+
+const KNOWN_CONTACTS_KEY = "contacts:known";
+
+async function getKnownContacts(kv: KVNamespace): Promise<Set<string>> {
+  try {
+    const raw = await kv.get(KNOWN_CONTACTS_KEY);
+    if (!raw) return new Set();
+    const obj = JSON.parse(raw) as Record<string, { since: string; source: string }>;
+    return new Set(Object.keys(obj).map((k) => k.toLowerCase()));
+  } catch { return new Set(); }
+}
+
+async function addKnownContact(kv: KVNamespace, login: string, source: string): Promise<void> {
+  let obj: Record<string, { since: string; source: string }> = {};
+  try { obj = JSON.parse((await kv.get(KNOWN_CONTACTS_KEY)) ?? "{}"); } catch { /* fresh */ }
+  const key = login.toLowerCase();
+  if (!obj[key]) obj[key] = { since: new Date().toISOString(), source };
+  await kv.put(KNOWN_CONTACTS_KEY, JSON.stringify(obj));
 }
 
 // ── Auth ──────────────────────────────────────────────────────
@@ -391,8 +412,10 @@ interface DiscoverResult {
   name: string | null;
   bio: string | null;
   html_url: string;
-  values_score: number;
-  confidence: "low" | "medium" | "high";      // v0.4 — dossier-richness signal
+  values_score: number;                        // = public_values_alignment (kept for stored rows/readers)
+  public_values_alignment?: number;            // v0.6 — canonical alignment score, 10 = strongest non-self match
+  connection_actionability?: number | null;    // v0.6 — path-to-conversation score
+  confidence: "low" | "medium" | "high";      // v0.4 — dossier-richness signal (= evidence_confidence)
   requires_human_review: true;                 // v0.4 — always true; intros are drafts
   source_kind: "github" | "rss";               // v0.4 — which anchor pipeline produced this
   values_notes: string;
@@ -672,17 +695,30 @@ async function valuesRerank(
   candidates: Candidate[],
   apiKey: string,
   valuesText: string,
+  opts: { calibration?: boolean } = {},
 ): Promise<DiscoverResult[]> {
   if (candidates.length === 0) return [];
 
   const block = candidates.map((c, i) => `[${i + 1}]\n${dossier(c)}`).join("\n\n");
 
-  const prompt = `You are a values-alignment filter for Rob Chuvala. Your job is to read GitHub candidate profiles and rank them by how strongly they match Rob's values.
+  // Calibration mode scores the OPERATOR's own profile as the lens's positive
+  // control — the self-identity backstop is swapped out, never both active.
+  const identityRule = opts.calibration
+    ? `CALIBRATION RUN (special mode):
+- The candidate below IS the operator this lens was distilled from. Score it honestly against the lens like any profile — this measures the LENS, not the person. Do not inflate. suggested_intro may be an empty string.`
+    : `SELF-IDENTITY RULE (hard rule, backstop — the code filters these before you see them):
+- If a candidate appears to BE Rob or a Rob-owned org (NorthwoodsSentinel, robert-chuvala, or a profile whose repos/urls are the operator's own infrastructure), do NOT score it and do NOT draft an intro. Omit it from results entirely. The operator is the calibration reference for this lens, not a discovery candidate.`;
+
+  const prompt = `You are a values-alignment filter for Rob Chuvala. Your job is to read GitHub candidate profiles and rank them by how strongly their PUBLIC, OBSERVABLE work matches Rob's values.
 
 ${valuesText}
 
-SELF-IDENTITY RULE (hard rule, backstop — the code filters these before you see them):
-- If a candidate appears to BE Rob or a Rob-owned org (NorthwoodsSentinel, robert-chuvala, or a profile whose repos/urls are the operator's own infrastructure), do NOT score it and do NOT draft an intro. Omit it from results entirely. The operator is the calibration reference for this lens, not a discovery candidate.
+${identityRule}
+
+SCORE SEMANTICS (defined scale — do not improvise):
+- public_values_alignment (1-10): how strongly the candidate's observable public output matches the values lens. 10 = the strongest observable NON-SELF match — multiple concrete, independent signals with no anti-signals. 9 = very strong match, multiple concrete signals. 8 = strong match with some missing context. This score measures visible evidence, not the person behind it.
+- evidence_confidence (low|medium|high): how much public surface there was to read. low = thin (few repos, empty bio) — a low-confidence score is a guess and will not alert.
+- connection_actionability (1-10): is there a real path to a real conversation — visible contact routes, recent activity, signs they engage with strangers.
 
 PRIVACY GUARDRAILS (hard rules):
 - Base every claim ONLY on the candidate's public output shown in the dossier. Never infer protected or sensitive attributes (health, politics, religion, finances, relationships).
@@ -697,15 +733,16 @@ Return ONLY valid JSON — no markdown fences, no preamble. Use this exact forma
 [
   {
     "index": 1,
-    "values_score": 9,
-    "confidence": "high",
+    "public_values_alignment": 9,
+    "evidence_confidence": "high",
+    "connection_actionability": 7,
     "values_notes": "2-3 sentences citing the specific observable signals",
     "suggested_intro": "one short paragraph Rob could send",
     "reach_via": ["github", "blog:https://...", "email:..."]
   }
 ]
 
-Where "index" is the 1-based candidate number. Only include candidates with values_score >= 6. Order by values_score descending. Cap at 15 results.`;
+Where "index" is the 1-based candidate number. Only include candidates with public_values_alignment >= 6. Order by public_values_alignment descending. Cap at 15 results.`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -730,8 +767,11 @@ Where "index" is the 1-based candidate number. Only include candidates with valu
 
   let ranked: Array<{
     index: number;
-    values_score: number;
-    confidence?: string;
+    public_values_alignment?: number;
+    evidence_confidence?: string;
+    connection_actionability?: number;
+    values_score?: number;          // pre-v0.6 field name — accepted for robustness
+    confidence?: string;            // pre-v0.6 field name
     values_notes: string;
     suggested_intro: string;
     reach_via: string[];
@@ -747,13 +787,17 @@ Where "index" is the 1-based candidate number. Only include candidates with valu
     .filter((r) => r.index >= 1 && r.index <= candidates.length)
     .map((r) => {
       const c = candidates[r.index - 1];
-      const conf = r.confidence === "low" || r.confidence === "high" ? r.confidence : "medium";
+      const alignment = r.public_values_alignment ?? r.values_score ?? 0;
+      const confRaw = r.evidence_confidence ?? r.confidence;
+      const conf = confRaw === "low" || confRaw === "high" ? confRaw : "medium";
       return {
         login: c.login,
         name: c.name,
         bio: c.bio,
         html_url: c.html_url,
-        values_score: r.values_score,
+        values_score: alignment,                    // kept: stored alerts / receipts / UI read this
+        public_values_alignment: alignment,          // v0.6 canonical name
+        connection_actionability: r.connection_actionability ?? null,
         confidence: conf,
         requires_human_review: true as const,
         source_kind: c.source_kind ?? "github" as const,
@@ -1042,6 +1086,8 @@ async function handleDiscover(body: DiscoverRequest, env: Env): Promise<Discover
   }
 
   // Phase 1: gather contributor logins across all anchors
+  const selfLogins = parseSelfLogins(env.SELF_GITHUB_LOGINS);
+  const knownContacts = await getKnownContacts(env.LOOKOUT_KV);
   const loginToAnchors = new Map<string, Set<string>>();
   for (const anchor of anchors) {
     let logins: string[];
@@ -1052,9 +1098,10 @@ async function handleDiscover(body: DiscoverRequest, env: Env): Promise<Discover
     }
     for (const login of logins) {
       // Identity layer BEFORE the values layer (CoE 2026-07-29, unanimous):
-      // the operator is the positive control, never a candidate. Deterministic —
-      // identity recognition must not depend on an LLM.
-      if (isSelf(login, env)) continue;
+      // the operator is the positive control, never a candidate; known
+      // contacts graduated out of discovery. Deterministic — identity
+      // recognition must not depend on an LLM.
+      if (classify(login, selfLogins, knownContacts) !== "candidate") continue;
       if (!loginToAnchors.has(login)) loginToAnchors.set(login, new Set());
       loginToAnchors.get(login)!.add(anchor);
     }
@@ -1294,9 +1341,12 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
   let candidates: Candidate[] = [];
   let fresh: string[] = [];
 
+  const selfLogins = parseSelfLogins(env.SELF_GITHUB_LOGINS);
+  const knownContacts = await getKnownContacts(env.LOOKOUT_KV);
+  const isCandidate = (l: string) => classify(l, selfLogins, knownContacts) === "candidate";
   if (a.kind === "rss") {
     const rssCandidates = await fetchRssCandidates(anchor);
-    candidates = rssCandidates.filter((c) => !seen.has(c.login) && !isSelf(c.login, env));
+    candidates = rssCandidates.filter((c) => !seen.has(c.login) && isCandidate(c.login));
     fresh = candidates.map((c) => c.login);
   } else {
     // Pull contributors from today's anchor
@@ -1306,7 +1356,7 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
     } catch {
       return { anchor, new_candidates: 0, alerts: 0 };
     }
-    fresh = logins.filter((l) => !seen.has(l) && !isSelf(l, env));
+    fresh = logins.filter((l) => !seen.has(l) && isCandidate(l));
     if (fresh.length === 0) {
       await recordYield(env.LOOKOUT_KV, anchor, 0, 0);
       return { anchor, new_candidates: 0, alerts: 0 };
@@ -1336,9 +1386,15 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
     return { anchor, new_candidates: candidates.length, alerts: 0 };
   }
 
-  // v0.4 severity routing: >=9 urgent ntfy · >=8 default ntfy · 6-7 digest-only KV
-  const alerts = ranked.filter((r) => r.values_score >= 8);
-  const digestOnly = ranked.filter((r) => r.values_score >= 6 && r.values_score < 8);
+  // v0.6 judgment predicate: strong observable alignment AND readable surface.
+  // (Previously a bare >=8 threshold; thin-dossier guesses no longer page.)
+  const asTriple = (r: DiscoverResult) => ({
+    public_values_alignment: r.public_values_alignment ?? r.values_score,
+    evidence_confidence: r.confidence,
+    connection_actionability: r.connection_actionability ?? 5,
+  });
+  const alerts = ranked.filter((r) => shouldAlert(asTriple(r)));
+  const digestOnly = ranked.filter((r) => !shouldAlert(asTriple(r)) && r.values_score >= 6);
 
   // Store each alert as a separate KV row for later /alerts review
   const ts = Date.now();
@@ -1395,7 +1451,7 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
 // The scheduled handler and POST /cron/run execute THIS function. A manual
 // run therefore observes exactly what the cron will do — no test-path drift.
 
-async function runDailyPipeline(env: Env): Promise<{ lens_version: string | null; lens_state: string; deadman_paged: boolean; anchor: string; new_candidates: number; alerts: number }> {
+async function runDailyPipeline(env: Env): Promise<{ lens_version: string | null; lens_state: string; deadman_paged: boolean; calibration_score?: number | null; calibration_drifted?: boolean; anchor: string; new_candidates: number; alerts: number }> {
   const lens = await refreshLens(env);
   let deadman_paged = false;
   if (!lens) {
@@ -1406,8 +1462,11 @@ async function runDailyPipeline(env: Env): Promise<{ lens_version: string | null
     }
   }
   const r = await runScheduledDiscover(env);
+  // Layer 3: calibration rides every daily run; its failure never blocks discovery.
+  let calibration: { score: number | null; drifted: boolean } = { score: null, drifted: false };
+  try { calibration = await runCalibration(env); } catch { /* calibration is advisory */ }
   const after = await getLens(env);
-  return { lens_version: lens?.version ?? null, lens_state: after.state, deadman_paged, ...r };
+  return { lens_version: lens?.version ?? null, lens_state: after.state, deadman_paged, calibration_score: calibration.score, calibration_drifted: calibration.drifted, ...r };
 }
 
 // ── v0.4: Outcomes ledger + monthly digest ─────────────────────
@@ -1422,7 +1481,50 @@ async function recordOutcome(kv: KVNamespace, login: string, status: OutcomeStat
   const rec = raw ? (JSON.parse(raw) as { login: string; history: Array<{ status: string; note: string; ts: string }> }) : { login, history: [] };
   rec.history.push({ status, note: note.slice(0, 500), ts: new Date().toISOString() });
   await kv.put(key, JSON.stringify(rec));
+  // v0.6 Layer 4 → Layer 0 wiring: a relationship in motion graduates the
+  // login out of discovery permanently. Discovery's job is strangers.
+  if ((GRADUATING_OUTCOMES as readonly string[]).includes(status)) {
+    await addKnownContact(kv, login, `outcome:${status}`);
+  }
   return rec;
+}
+
+// ── v0.6 Layer 3: calibration — the operator as positive control ──
+// Scores the operator's own profile through the live lens ON PURPOSE, daily.
+// Never alerted, never intro'd; stored as a time series. If today's self-score
+// drops >=2 below the trailing median, either the public surface changed or
+// the LENS drifted — either way the run says so instead of staying quiet.
+async function runCalibration(env: Env): Promise<{ score: number | null; drifted: boolean; median: number | null; lens_version: string | null }> {
+  const operator = [...parseSelfLogins(env.SELF_GITHUB_LOGINS)][0];
+  if (!operator) return { score: null, drifted: false, median: null, lens_version: null };
+  const vlens = await getLens(env);
+  const candidate = await buildCandidate(operator, "calibration", env.GITHUB_TOKEN);
+  if (!candidate) return { score: null, drifted: false, median: null, lens_version: vlens.version };
+  const ranked = await valuesRerank([candidate], env.ANTHROPIC_API_KEY, vlens.text, { calibration: true });
+  const score = ranked[0]?.public_values_alignment ?? ranked[0]?.values_score ?? null;
+  if (score === null) return { score: null, drifted: false, median: null, lens_version: vlens.version };
+
+  const today = new Date().toISOString().slice(0, 10);
+  const prior = await env.LOOKOUT_KV.list({ prefix: "calibration:" });
+  const history: number[] = [];
+  for (const k of prior.keys.slice(-7)) {
+    if (k.name === `calibration:${today}`) continue;
+    try {
+      const row = JSON.parse((await env.LOOKOUT_KV.get(k.name)) ?? "null") as { score?: number } | null;
+      if (row?.score != null) history.push(row.score);
+    } catch { /* skip */ }
+  }
+  const { drifted, median } = calibrationDrift(history, score);
+  await env.LOOKOUT_KV.put(
+    `calibration:${today}`,
+    JSON.stringify({ score, lens_version: vlens.version, drifted, median, ts: new Date().toISOString() }),
+    { expirationTtl: 60 * 60 * 24 * 180 },
+  );
+  if (drifted) {
+    await notifyNtfy(env, "Lookout lens CALIBRATION DRIFT",
+      `Operator self-score ${score} vs trailing median ${median}. Either the public surface changed or the lens drifted — scores from this lens deserve suspicion until reviewed.`, true);
+  }
+  return { score, drifted, median, lens_version: vlens.version };
 }
 
 async function buildMonthlyDigest(env: Env): Promise<string> {
@@ -1490,13 +1592,20 @@ export default {
           lens_age_hours = Math.round((Date.now() - Date.parse(lens.fetched_at)) / 3600_000 * 10) / 10;
         }
       } catch { /* health never fails on lens state */ }
+      let calibration: unknown = null;
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const raw = await env.LOOKOUT_KV.get(`calibration:${today}`);
+        if (raw) calibration = JSON.parse(raw);
+      } catch { /* health never fails on calibration state */ }
       return secureJsonResponse({
         status: "ok",
         daemon: "lookout",
-        version: "0.4",
-        features: ["search", "discover", "lens", "outcomes", "intents", "rss-anchors"],
+        version: "0.6",
+        features: ["search", "discover", "lens", "outcomes", "intents", "rss-anchors", "identity-layer", "calibration"],
         lens_version,
         lens_age_hours,
+        calibration,
         ts: new Date().toISOString(),
       });
     }
@@ -1629,9 +1738,31 @@ export default {
     // POST /cron/run — manual trigger for the FULL daily pipeline (same code path
     // as the cron). Optional {"mode":"deadman-drill"} exercises only the
     // failure-paging leg against current lens state.
+    // v0.6 Layer 0: known-contact set — GET lists, POST graduates a login manually
+    if (path === "/contacts/known" && request.method === "GET") {
+      const denied = requireAuth(request, env);
+      if (denied) return denied;
+      const raw = (await env.LOOKOUT_KV.get(KNOWN_CONTACTS_KEY)) ?? "{}";
+      return secureJsonResponse({ known: JSON.parse(raw), ts: new Date().toISOString() });
+    }
+    if (path === "/contacts/known" && request.method === "POST") {
+      const denied = requireAuth(request, env);
+      if (denied) return denied;
+      let body: { login?: string; source?: string };
+      try { body = (await request.json()) as { login?: string; source?: string }; } catch { body = {}; }
+      if (!body.login) return secureJsonResponse({ error: "login required" }, { status: 400 });
+      await addKnownContact(env.LOOKOUT_KV, body.login, body.source ?? "manual");
+      return secureJsonResponse({ added: body.login.toLowerCase(), ts: new Date().toISOString() });
+    }
+
     if (path === "/cron/run" && request.method === "POST") {
       let mode = "daily";
       try { mode = ((await request.json()) as { mode?: string }).mode ?? "daily"; } catch { /* empty body = daily */ }
+      if (mode === "calibrate") {
+        // Layer 3 alone — score the operator through the live lens, no discovery.
+        const cal = await runCalibration(env);
+        return secureJsonResponse({ mode: "calibrate", ...cal, ts: new Date().toISOString() });
+      }
       if (mode === "deadman-drill") {
         const active = await getLens(env);
         if (active.state !== "fresh") {
