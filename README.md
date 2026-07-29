@@ -195,3 +195,11 @@ Part of the [Northwoods Sentinel Labs](https://northwoodssentinel.com) ecosystem
 ### v0.5 — the values lens goes live too
 
 The `/discover` judge is now daemon-fed with the same contract as search: the daily distillation also produces `values_signals`, `values_anti_signals`, and `connection_intent` layers, every candidate response carries `values_lens_version`, and the hardcoded values profile becomes the fallback rung. The output contract and an operational anti-signal floor stay code-owned.
+
+## v0.6 — the calibrated instrument
+
+A discovery tool has two jobs: find values-aligned people, and know who its operator already is. v0.6 adds the identity layer (born from a real incident: the tool scored its own maker 9/10 and drafted him a cold intro to himself):
+
+- **Identity before judgment.** Every login is classified `self` / `known-contact` / `candidate` deterministically — before any LLM call. Operators (`SELF_GITHUB_LOGINS`) are never candidates; people with an active relationship (outcomes `contacted`/`replied`/`collaborating`, or `POST /contacts/known`) graduate out of discovery permanently.
+- **Scores with defined semantics.** `values_score` split into `public_values_alignment` (10 = strongest observable *non-self* match), `evidence_confidence`, and `connection_actionability`. Alerting is a predicate — strong alignment AND readable surface — so thin-dossier guesses don't page.
+- **Calibration.** Every daily run scores the operator's own profile through the live lens on purpose (never alerted, never intro'd) and keeps the time series. A ≥2-point drop below the trailing median pages: either your public surface changed or your lens drifted. The instrument measures itself with its maker as the control standard.
