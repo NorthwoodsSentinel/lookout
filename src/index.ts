@@ -19,6 +19,20 @@ interface Env {
   DAEMON?: Fetcher;                // optional — service binding to the daemon worker (required when
                                    // both live on workers.dev: worker→worker fetch of *.workers.dev is blocked)
   NTFY_TOPIC?: string;             // optional — ntfy.sh topic for severity-routed alerts
+  // v0.5.1 — identity layer before the values layer (self-recognition)
+  SELF_GITHUB_LOGINS?: string;     // optional — comma-separated operator logins/orgs; default "NorthwoodsSentinel"
+}
+
+// ── Identity layer (v0.5.1) ──────────────────────────────────
+// The operator is the positive control for the values lens, never a candidate.
+// Deterministic check, runs BEFORE any LLM sees a login (CoE 2026-07-29:
+// "identity recognition should not depend on an LLM"). Prevents self-alerts
+// and self-addressed intros; operator-owned anchors still surface their
+// OUTSIDE contributors.
+function isSelf(login: string, env: Env): boolean {
+  const selfLogins = (env.SELF_GITHUB_LOGINS ?? "NorthwoodsSentinel")
+    .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return selfLogins.includes(login.toLowerCase());
 }
 
 // ── Auth ──────────────────────────────────────────────────────
@@ -667,6 +681,9 @@ async function valuesRerank(
 
 ${valuesText}
 
+SELF-IDENTITY RULE (hard rule, backstop — the code filters these before you see them):
+- If a candidate appears to BE Rob or a Rob-owned org (NorthwoodsSentinel, robert-chuvala, or a profile whose repos/urls are the operator's own infrastructure), do NOT score it and do NOT draft an intro. Omit it from results entirely. The operator is the calibration reference for this lens, not a discovery candidate.
+
 PRIVACY GUARDRAILS (hard rules):
 - Base every claim ONLY on the candidate's public output shown in the dossier. Never infer protected or sensitive attributes (health, politics, religion, finances, relationships).
 - values_notes must cite the observable signal (repo, bio phrase, topic), not a character judgment.
@@ -1034,6 +1051,10 @@ async function handleDiscover(body: DiscoverRequest, env: Env): Promise<Discover
       continue;
     }
     for (const login of logins) {
+      // Identity layer BEFORE the values layer (CoE 2026-07-29, unanimous):
+      // the operator is the positive control, never a candidate. Deterministic —
+      // identity recognition must not depend on an LLM.
+      if (isSelf(login, env)) continue;
       if (!loginToAnchors.has(login)) loginToAnchors.set(login, new Set());
       loginToAnchors.get(login)!.add(anchor);
     }
@@ -1275,7 +1296,7 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
 
   if (a.kind === "rss") {
     const rssCandidates = await fetchRssCandidates(anchor);
-    candidates = rssCandidates.filter((c) => !seen.has(c.login));
+    candidates = rssCandidates.filter((c) => !seen.has(c.login) && !isSelf(c.login, env));
     fresh = candidates.map((c) => c.login);
   } else {
     // Pull contributors from today's anchor
@@ -1285,7 +1306,7 @@ async function runScheduledDiscover(env: Env): Promise<{ anchor: string; new_can
     } catch {
       return { anchor, new_candidates: 0, alerts: 0 };
     }
-    fresh = logins.filter((l) => !seen.has(l));
+    fresh = logins.filter((l) => !seen.has(l) && !isSelf(l, env));
     if (fresh.length === 0) {
       await recordYield(env.LOOKOUT_KV, anchor, 0, 0);
       return { anchor, new_candidates: 0, alerts: 0 };
