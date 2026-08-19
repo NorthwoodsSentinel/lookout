@@ -22,7 +22,7 @@ crons = ["0 14 * * *", "0 15 1 * *"]   # 14:00 UTC daily = 9:00 AM Central · mo
 # Create with `wrangler kv namespace create LOOKOUT_KV` and paste the ID below.
 [[kv_namespaces]]
 binding = "LOOKOUT_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "7ba4b3d98ffa4ffea1fb049b5aad90fa"
 
 # Service binding to your daemon worker — REQUIRED if both run on workers.dev
 # (a Worker cannot fetch another *.workers.dev subdomain; the binding bypasses that)

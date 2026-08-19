@@ -437,8 +437,11 @@ interface DiscoverResponse {
 
 // ── Brave Search ───────────────────────────────────────────────
 
-async function braveSearch(query: string, count: number, apiKey: string): Promise<BraveResult[]> {
+async function braveSearch(query: string, count: number, apiKey: string, freshness?: string): Promise<BraveResult[]> {
   const params = new URLSearchParams({ q: query, count: String(count) });
+  // freshness: pd/pw/pm/py or YYYY-MM-DDtoYYYY-MM-DD. Biases Brave toward recent pages
+  // (used by RADAR so a live feed surfaces this-week research, not evergreen top hits).
+  if (freshness) params.set("freshness", freshness);
   const res = await fetch(`https://api.search.brave.com/res/v1/web/search?${params}`, {
     headers: {
       "Accept": "application/json",
@@ -996,10 +999,11 @@ async function handleSearch(
   query: string,
   count: number,
   env: Env,
+  freshness?: string,
 ): Promise<SearchResponse> {
   let braveResults: BraveResult[];
   try {
-    braveResults = await braveSearch(query, Math.max(count * 2, 15), env.BRAVE_SEARCH_KEY);
+    braveResults = await braveSearch(query, Math.max(count * 2, 15), env.BRAVE_SEARCH_KEY, freshness);
   } catch (e) {
     return {
       query,
@@ -1680,9 +1684,9 @@ export default {
         return secureJsonResponse({ error: "Content-Type must be application/json" }, { status: 415 });
       }
 
-      let body: { query?: string; count?: number };
+      let body: { query?: string; count?: number; freshness?: string };
       try {
-        body = (await request.json()) as { query?: string; count?: number };
+        body = (await request.json()) as { query?: string; count?: number; freshness?: string };
       } catch {
         return secureJsonResponse({ error: "Invalid JSON body" }, { status: 400 });
       }
@@ -1696,7 +1700,8 @@ export default {
       }
 
       const count = Math.min(Math.max(body.count ?? 5, 1), 10);
-      const data = await handleSearch(query, count, env);
+      const fr = typeof body.freshness === "string" && /^(pd|pw|pm|py|\d{4}-\d{2}-\d{2}to\d{4}-\d{2}-\d{2})$/.test(body.freshness) ? body.freshness : undefined;
+      const data = await handleSearch(query, count, env, fr);
       return secureJsonResponse(data);
     }
 
