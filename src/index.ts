@@ -1065,12 +1065,21 @@ async function handleDiscover(body: DiscoverRequest, env: Env): Promise<Discover
   const perAnchor = Math.min(Math.max(body.per_anchor ?? 15, 5), 30);
 
   const defaultAnchors = [
-    "NorthwoodsSentinel/loam",
-    "NorthwoodsSentinel/mycelia",
-    "modelcontextprotocol/servers",
-    "bluesky-social/atproto",
-    "NorthwoodsSentinel/brook",
+    // WHERE the crawl looks = a projection of Rob's TELOS onto the ecosystem (his own words,
+    // 2026-08-19: "we are anchoring on my telos"). Each anchor is a telos facet with a real
+    // multi-contributor base, so the values lens (which IS his telos) has people to score.
+    "NorthwoodsSentinel/loam",        // his substrate
+    "NorthwoodsSentinel/mycelia",     // his fleet
+    "NorthwoodsSentinel/brook",       // his overwatch
+    "mem0ai/mem0",                    // memory-sovereignty neighborhood
+    "letta-ai/letta",                 // persistent-agent memory (MemGPT)
+    "topoteretes/cognee",             // knowledge-graph memory
+    "modelcontextprotocol/servers",   // MCP
+    "bluesky-social/atproto",         // local-first / data sovereignty
   ];
+  // NOTE: a SOLO repo (e.g. R3dy/RealMemory) is a dead-end for a contributor-adjacency crawl —
+  // nobody co-commits, so it yields nobody. Lone sovereign builders (Royce, Rob) are found by
+  // the VALUES LENS on a populated neighborhood, never by anchoring their own solo repo.
 
   // Validate user-provided anchors; silently drop invalid ones
   const rawAnchors = body.anchors && body.anchors.length > 0 ? body.anchors : defaultAnchors;
