@@ -41,7 +41,14 @@ const RADAR_CRON = "0 13 * * *";   // 13:00 UTC = 8:00 AM Central — same slot 
 function radarDeps(env: Env) {
   return {
     // Same call RadarPull made over HTTP (count default 5, this-week freshness), now in-process.
-    search: async (query: string) => (await handleSearch(query, 5, env, "pw")).results,
+    // handleSearch reports Brave/re-rank outages as a 200 with `error` set, not a throw — treat
+    // that as a failed topic, or a total outage reads as a quiet day (Codex review 2026-09-27).
+    search: async (query: string) => {
+      const timeout = new Promise<never>((_, rej) => setTimeout(() => rej(new Error("search timeout 90s")), 90_000));
+      const r = await Promise.race([handleSearch(query, 5, env, "pw"), timeout]);
+      if (r.error) throw new Error(r.error);
+      return r.results;
+    },
     listAlerts: () => listAlerts(env.LOOKOUT_KV, false),
   };
 }
@@ -1658,9 +1665,17 @@ export default {
       if (request.method === "POST") {
         let list: unknown;
         try { list = await request.json(); } catch { return secureJsonResponse({ error: "Invalid JSON body" }, { status: 400 }); }
-        const needs = path === "/radar/topics" ? ["tag", "relates_to", "query"] : ["name", "relates_to", "url", "kind", "score", "filter"];
-        if (!Array.isArray(list) || list.length === 0 || !list.every((x) => x && typeof x === "object" && needs.every((k) => k in (x as object)))) {
-          return secureJsonResponse({ error: `Body must be a non-empty array; each entry needs ${needs.join(", ")}` }, { status: 400 });
+        const str = (v: unknown) => typeof v === "string" && v.trim().length > 0;
+        const validTopic = (x: any) => x && str(x.tag) && str(x.relates_to) && str(x.query) && x.query.length <= 500;
+        const validSource = (x: any) => x && str(x.name) && str(x.relates_to) && str(x.url) && /^https:\/\//.test(x.url)
+          && typeof x.score === "number" && Number.isFinite(x.score) && typeof x.filter === "boolean"
+          && (x.kind === "feed" || (x.kind === "listing" && str(x.linkPrefix)));
+        const valid = path === "/radar/topics" ? validTopic : validSource;
+        if (!Array.isArray(list) || list.length === 0 || !list.every(valid)) {
+          const shape = path === "/radar/topics"
+            ? "{tag, relates_to, query (<=500 chars)} — all non-empty strings"
+            : "{name, relates_to, url (https), kind: feed|listing (+linkPrefix), score: number, filter: boolean}";
+          return secureJsonResponse({ error: `Body must be a non-empty array of ${shape}` }, { status: 400 });
         }
         await env.LOOKOUT_KV.put(key, JSON.stringify(list));
         return secureJsonResponse({ ok: true, count: list.length });

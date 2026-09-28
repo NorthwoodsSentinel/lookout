@@ -3,7 +3,7 @@ import { runRadar, RADAR_TOPICS_KEY, RADAR_SOURCES_KEY } from "../src/radar";
 
 function fakeKV() {
   const m = new Map<string, string>();
-  return { m, kv: { get: async (k: string) => m.get(k) ?? null, put: async (k: string, v: string) => { m.set(k, v); } } as any };
+  return { m, kv: { get: async (k: string) => m.get(k) ?? null, put: async (k: string, v: string) => { m.set(k, v); }, delete: async (k: string) => { m.delete(k); } } as any };
 }
 
 const FEED = (items: [string, string][]) =>
@@ -70,6 +70,25 @@ describe("radar", () => {
     await expect(runRadar(env, deps)).rejects.toThrow("all topics failed");
     expect(pings.some((p) => p.title === "Radar producer DOWN")).toBe(true);
     expect(JSON.parse(m.get("radar:last_run")!).verdict).toBe("fail");
+  });
+
+  test("a held lock refuses an overlapping run and leaves state untouched", async () => {
+    const { m, env, deps } = setup([{ url: "https://a", title: "A", daemon_score: 9, daemon_note: "n" }]);
+    m.set("radar:lock", "2026-09-28T00:00:00Z");
+    await expect(runRadar(env, deps)).rejects.toThrow("holds the lock");
+    expect(m.get("radar:frontpage")).toBeUndefined();
+    m.delete("radar:lock");
+    await runRadar(env, deps);
+    expect(m.get("radar:lock")).toBeUndefined();   // released after a run
+  });
+
+  test("a failed ntfy delivery is recorded in last_run and the front page, not swallowed", async () => {
+    const { m, env, deps } = setup([{ url: "https://a", title: "A", daemon_score: 9, daemon_note: "n" }]);
+    globalThis.fetch = (async (url: any) => String(url).startsWith("https://ntfy.sh/")
+      ? new Response("rate limited", { status: 429 }) : new Response(FEED(feedItems))) as any;
+    const r = await runRadar(env, deps);
+    expect(r.verdict).toBe("ok-ping-failed");
+    expect(JSON.parse(m.get("radar:frontpage")!).errors.some((e: string) => e.includes("ntfy 429"))).toBe(true);
   });
 
   test("builders: read alerts are excluded", async () => {

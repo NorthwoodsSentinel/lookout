@@ -126,17 +126,33 @@ async function configList<T>(kv: KVNamespace, key: string, defaults: T[]): Promi
 export const RADAR_TOPICS_KEY = "config:radar_topics";
 export const RADAR_SOURCES_KEY = "config:radar_sources";
 
-async function ping(env: RadarEnv, title: string, body: string, priority: "high" | "urgent") {
+/** Returns an error string on failure (never throws) so the run can record it. */
+async function ping(env: RadarEnv, title: string, body: string, priority: "high" | "urgent"): Promise<string | null> {
   const topic = env.RADAR_NTFY_TOPIC || env.NTFY_TOPIC;
-  if (!topic) return;
-  await fetch(`https://ntfy.sh/${topic}`, {
-    method: "POST",
-    headers: { Title: title.replace(/[^\x20-\x7E]/g, ""), Priority: priority, Tags: "satellite" },
-    body, signal: AbortSignal.timeout(15_000),
-  }).catch(() => {});
+  if (!topic) return "ntfy: no topic configured";
+  try {
+    const res = await fetch(`https://ntfy.sh/${topic}`, {
+      method: "POST",
+      headers: { Title: title.replace(/[^\x20-\x7E]/g, ""), Priority: priority, Tags: "satellite" },
+      body, signal: AbortSignal.timeout(15_000),
+    });
+    return res.ok ? null : `ntfy ${res.status} for "${title}"`;
+  } catch (e) { return `ntfy failed for "${title}": ${e instanceof Error ? e.message : String(e)}`; }
 }
 
+const LOCK_KEY = "radar:lock";
+const LOCK_TTL_S = 900;   // KV has no compare-and-set: this narrows (does not eliminate) cron vs manual overlap
+
 export async function runRadar(env: RadarEnv, deps: RadarDeps, now = new Date()) {
+  const kv = env.LOOKOUT_KV;
+  const held = await kv.get(LOCK_KEY);
+  if (held) throw new Error(`radar: another run holds the lock (since ${held})`);
+  await kv.put(LOCK_KEY, now.toISOString(), { expirationTtl: LOCK_TTL_S });
+  try { return await runRadarLocked(env, deps, now); }
+  finally { await kv.delete(LOCK_KEY).catch(() => {}); }
+}
+
+async function runRadarLocked(env: RadarEnv, deps: RadarDeps, now: Date) {
   const kv = env.LOOKOUT_KV;
   const nowIso = now.toISOString(), nowMs = now.getTime();
   const topics = await configList(kv, RADAR_TOPICS_KEY, DEFAULT_TOPICS);
@@ -163,7 +179,8 @@ export async function runRadar(env: RadarEnv, deps: RadarDeps, now = new Date())
   }
   if (topicFailures === topics.length) {
     await kv.put("radar:last_run", JSON.stringify({ at: nowIso, verdict: "fail", errors }));
-    await ping(env, "Radar producer DOWN", `lookout radar: all ${topics.length} topics failed at ${nowIso} — ${errors[0]}. Do not trust the quiet.`, "high");
+    const perr = await ping(env, "Radar producer DOWN", `lookout radar: all ${topics.length} topics failed at ${nowIso} — ${errors[0]}. Do not trust the quiet.`, "high");
+    if (perr) await kv.put("radar:last_run", JSON.stringify({ at: nowIso, verdict: "fail", errors: [...errors, perr] }));
     throw new Error(`radar: all topics failed: ${errors[0]}`);
   }
 
@@ -202,31 +219,36 @@ export async function runRadar(env: RadarEnv, deps: RadarDeps, now = new Date())
       .sort((a, b) => (b.values_score ?? 0) - (a.values_score ?? 0));
   } catch (e) { errors.push(`alerts: ${e instanceof Error ? e.message : String(e)}`); }
 
-  const frontpage = { generated: nowIso, count: items.length, items, builders: builders.slice(0, 8), errors, producer: "lookout/radar" };
-  await Promise.all([
-    kv.put("radar:frontpage", JSON.stringify(frontpage)),
-    kv.put("radar:store", JSON.stringify(store)),
-    kv.put("radar:seen", JSON.stringify(seen)),
-    kv.put("radar:sources_seen", JSON.stringify(sourcesSeen)),
-  ]);
+  // Write order (Codex review): store + sources_seen, then pings, then the ping-dedup sets LAST.
+  // A failure before the seen-writes leaves items un-seen, so the next run re-surfaces and re-pings
+  // them (duplicate > lost). Writes are sequential so a rejection stops the run instead of half-committing.
+  await kv.put("radar:store", JSON.stringify(store));
+  await kv.put("radar:sources_seen", JSON.stringify(sourcesSeen));
 
-  // 5. Pings — once per genuinely-new item at/above threshold
+  // 5. Pings — once per genuinely-new item at/above threshold; delivery failures are recorded, not swallowed
   const pings = newlySurfaced.filter((f) => f.score >= PING_THRESHOLD);
+  const pingErrors: string[] = [];
+  const note = (e: string | null) => { if (e) pingErrors.push(e); };
   const sourcePings = pings.filter((f) => f.topic === "source-follow");
-  if (sourcePings.length) await ping(env, `Radar sources: ${sourcePings.length} new post(s)`,
-    sourcePings.slice(0, 3).map((f) => `${f.title}\n${f.url}`).join("\n\n") + (sourcePings.length > 3 ? "\n..." : ""), "high");
+  if (sourcePings.length) note(await ping(env, `Radar sources: ${sourcePings.length} new post(s)`,
+    sourcePings.slice(0, 3).map((f) => `${f.title}\n${f.url}`).join("\n\n") + (sourcePings.length > 3 ? "\n..." : ""), "high"));
   const topicPings = pings.filter((f) => f.topic !== "source-follow");
   if (topicPings.length) { const top = topicPings[0];
-    await ping(env, `Radar [${top.score}] ${top.relates_to}`, `${top.title}\n${top.url}`, top.score >= 10 ? "urgent" : "high"); }
+    note(await ping(env, `Radar [${top.score}] ${top.relates_to}`, `${top.title}\n${top.url}`, top.score >= 10 ? "urgent" : "high")); }
 
   const firstBuilderRun = Object.keys(bseen).length === 0;
   const newBuilders = builders.filter((b) => b.login && !bseen[b.login] && (b.values_score ?? 0) >= PING_THRESHOLD);
   for (const b of builders) if (b.login && !bseen[b.login]) bseen[b.login] = nowIso;
-  await kv.put("radar:builders_seen", JSON.stringify(bseen));
-  if (!firstBuilderRun && newBuilders.length) await ping(env, `Radar builders: ${newBuilders.length} kindred`,
-    `${newBuilders.slice(0, 5).map((b) => `${b.login} (${b.values_score})`).join(", ")}${newBuilders.length > 5 ? " ..." : ""}\nlookout /alerts`, "high");
+  if (!firstBuilderRun && newBuilders.length) note(await ping(env, `Radar builders: ${newBuilders.length} kindred`,
+    `${newBuilders.slice(0, 5).map((b) => `${b.login} (${b.values_score})`).join(", ")}${newBuilders.length > 5 ? " ..." : ""}\nlookout /alerts`, "high"));
+  errors.push(...pingErrors);
 
-  const summary = { at: nowIso, verdict: "ok", fresh: items.length, surfaced: newlySurfaced.length, pinged: pings.length,
+  await kv.put("radar:seen", JSON.stringify(seen));
+  await kv.put("radar:builders_seen", JSON.stringify(bseen));
+  const frontpage = { generated: nowIso, count: items.length, items, builders: builders.slice(0, 8), errors, producer: "lookout/radar" };
+  await kv.put("radar:frontpage", JSON.stringify(frontpage));
+
+  const summary = { at: nowIso, verdict: pingErrors.length ? "ok-ping-failed" : "ok", fresh: items.length, surfaced: newlySurfaced.length, pinged: pings.length,
     builders: builders.length, builders_new: newBuilders.length, errors: errors.length, error_detail: errors.slice(0, 10) };
   await kv.put("radar:last_run", JSON.stringify(summary));
   return summary;
