@@ -21,6 +21,8 @@ interface Env {
   NTFY_TOPIC?: string;             // optional — ntfy.sh topic for severity-routed alerts
   // v0.5.1 — identity layer before the values layer (self-recognition)
   SELF_GITHUB_LOGINS?: string;     // optional — comma-separated operator logins/orgs; default "NorthwoodsSentinel"
+  // radar (2026-09-27) — research radar ported from Lares RadarPull
+  RADAR_NTFY_TOPIC?: string;       // optional — topic for radar pings (Rob's phone); falls back to NTFY_TOPIC
 }
 
 // ── Identity layer (v0.5.1, extended v0.6) ───────────────────
@@ -32,6 +34,17 @@ interface Env {
 // out of discovery because a relationship already exists.
 import { parseSelfLogins, isSelfLogin, classify, shouldAlert, calibrationDrift, GRADUATING_OUTCOMES } from "./identity";
 import type { ScoreTriple, Classification } from "./identity";
+import { runRadar, RADAR_TOPICS_KEY, RADAR_SOURCES_KEY, DEFAULT_TOPICS, DEFAULT_SOURCES } from "./radar";
+
+const RADAR_CRON = "0 13 * * *";   // 13:00 UTC = 8:00 AM Central — same slot the Lares RadarPull used
+
+function radarDeps(env: Env) {
+  return {
+    // Same call RadarPull made over HTTP (count default 5, this-week freshness), now in-process.
+    search: async (query: string) => (await handleSearch(query, 5, env, "pw")).results,
+    listAlerts: () => listAlerts(env.LOOKOUT_KV, false),
+  };
+}
 
 function isSelf(login: string, env: Env): boolean {
   return isSelfLogin(login, parseSelfLogins(env.SELF_GITHUB_LOGINS));
@@ -1627,6 +1640,35 @@ export default {
     const authFail = requireAuth(request, env);
     if (authFail) return authFail;
 
+    // ── Radar (2026-09-27): front page, manual run, editable topics/sources ──
+    if (path === "/radar" && request.method === "GET") {
+      const fp = await env.LOOKOUT_KV.get("radar:frontpage");
+      const last = await env.LOOKOUT_KV.get("radar:last_run");
+      return secureJsonResponse({ frontpage: fp ? JSON.parse(fp) : null, last_run: last ? JSON.parse(last) : null });
+    }
+    if (path === "/radar/run" && request.method === "POST") {
+      try {
+        return secureJsonResponse(await runRadar(env, radarDeps(env)));
+      } catch (e) {
+        return secureJsonResponse({ verdict: "fail", error: e instanceof Error ? e.message : String(e) }, { status: 502 });
+      }
+    }
+    if ((path === "/radar/topics" || path === "/radar/sources") && (request.method === "GET" || request.method === "POST")) {
+      const key = path === "/radar/topics" ? RADAR_TOPICS_KEY : RADAR_SOURCES_KEY;
+      if (request.method === "POST") {
+        let list: unknown;
+        try { list = await request.json(); } catch { return secureJsonResponse({ error: "Invalid JSON body" }, { status: 400 }); }
+        const needs = path === "/radar/topics" ? ["tag", "relates_to", "query"] : ["name", "relates_to", "url", "kind", "score", "filter"];
+        if (!Array.isArray(list) || list.length === 0 || !list.every((x) => x && typeof x === "object" && needs.every((k) => k in (x as object)))) {
+          return secureJsonResponse({ error: `Body must be a non-empty array; each entry needs ${needs.join(", ")}` }, { status: 400 });
+        }
+        await env.LOOKOUT_KV.put(key, JSON.stringify(list));
+        return secureJsonResponse({ ok: true, count: list.length });
+      }
+      const raw = await env.LOOKOUT_KV.get(key);
+      return secureJsonResponse(raw ? JSON.parse(raw) : (path === "/radar/topics" ? DEFAULT_TOPICS : DEFAULT_SOURCES));
+    }
+
     // Landing page
     if (path === "/" && request.method === "GET") {
       return secureHtmlResponse(renderSearchPage());
@@ -1878,6 +1920,14 @@ export default {
 
   // ── Cron Handler — dispatches by schedule string ─────────────
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (controller.cron === RADAR_CRON) {
+      ctx.waitUntil(
+        runRadar(env, radarDeps(env))
+          .then((r) => console.log(`Lookout radar: ${JSON.stringify(r)}`))
+          .catch((e) => console.error("Lookout radar failed:", e)),
+      );
+      return;
+    }
     if (controller.cron === "0 15 1 * *") {
       // Monthly digest
       ctx.waitUntil(

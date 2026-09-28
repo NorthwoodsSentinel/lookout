@@ -16,7 +16,7 @@ enabled = true
 
 # v0.3 — daily scheduled discover · v0.4 adds monthly digest (1st of month)
 [triggers]
-crons = ["0 14 * * *", "0 15 1 * *"]   # 14:00 UTC daily = 9:00 AM Central · monthly digest
+crons = ["0 14 * * *", "0 15 1 * *", "0 13 * * *"]   # 14:00 UTC daily = 9:00 AM Central · monthly digest · 13:00 UTC radar (8 AM Central)
 
 # KV namespace for lens snapshot, seen-set, alerts, outcomes, yield, intent log
 # Create with `wrangler kv namespace create LOOKOUT_KV` and paste the ID below.
