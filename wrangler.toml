@@ -29,3 +29,7 @@ id = "7ba4b3d98ffa4ffea1fb049b5aad90fa"
 # [[services]]
 # binding = "DAEMON"
 # service = "your-daemon-worker-name"
+
+# Deployment identity for /health (read by deploy-receipt).
+[version_metadata]
+binding = "CF_VERSION_METADATA"

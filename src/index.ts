@@ -8,6 +8,7 @@ interface Env {
   LOOKOUT_API_KEY: string;
   GITHUB_TOKEN: string;
   ENVIRONMENT: string;
+  CF_VERSION_METADATA?: { id: string; tag: string; timestamp: string }; // [version_metadata] binding: which deployment is running
   // v0.3 — scheduled discover state + notifications
   LOOKOUT_KV: KVNamespace;
   NOTIFY_EMAIL_TO?: string;        // optional — destination address
@@ -1635,6 +1636,8 @@ export default {
         status: "ok",
         daemon: "lookout",
         version: "0.6",
+        // Deployment identity (separate from the app version above): read by /root/projects/deploy-receipt.
+        deployment: env.CF_VERSION_METADATA ? { id: env.CF_VERSION_METADATA.id, tag: env.CF_VERSION_METADATA.tag, timestamp: env.CF_VERSION_METADATA.timestamp } : null,
         features: ["search", "discover", "lens", "outcomes", "intents", "rss-anchors", "identity-layer", "calibration"],
         lens_version,
         lens_age_hours,
